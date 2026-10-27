@@ -1,2 +1,2 @@
-#v1.0: Release
+v1.0: Release
       - v1.0.1: Added V2 incase viewing replay isn't possible
