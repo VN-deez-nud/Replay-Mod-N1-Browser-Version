@@ -83,9 +83,3 @@ Leave any **live match** before watching.
 ## `.n1replay` files
 
 Portable captures for backup or sharing between browsers/PCs (anyone with this mod can open them).
-
-
-## UPDATE LOG
-
-v1.0: Release 
-v1.0.1: Added ReplayModV2 incase you can't view the replay
