@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Narrow.one - Battle Log (Replays) + Free cam + Rename + Export
 // @namespace    local
-// @version      1.5
+// @version      1.1
 // @description  Records matches and replays them. Free cam (F), pause (P), previous/next player POV (, and .), rename, export to .n1replay, import / watch from file. You can see yourself playing the match and view the POV of other players. This script is made by Claude based on 5 scripts made by Aspect, debugged by Grok, checked by Aspect.
 // @author       Claude / Grok / EF Aspect
 // @match        https://narrow.one/*
