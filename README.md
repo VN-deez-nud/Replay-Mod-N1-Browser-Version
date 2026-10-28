@@ -9,6 +9,8 @@ Record your Narrow One matches in the browser and rewatch them later as a specta
 Inspired by the network-capture idea used in tools like [Xeltalliv/n1-replay-mod](https://github.com/Xeltalliv/n1-replay-mod).  
 This build is **browser-only** (Tampermonkey + IndexedDB). No Node.js server required.
 
+**USE IT AT YOUR OWN RISK, I WONT BE RESPONSIBLE FOR ANY ACCOUNT BANS WHICH RELATED TO THIS MOD, THOUGH THE CHANCE IS LOW**
+
 ---
 
 ## How it works
