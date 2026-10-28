@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Narrow.one - Battle Log (Replays) + Free cam + Rename + Export/Import
+// @name         Narrow.one - Battle Log (Replays) + Free cam + Rename + Export
 // @namespace    local
-// @version      1.0
-// @description  Records matches and replays them. Free cam (F), rename, export to .n1replay, import / watch from file. This script is made by Claude based on 5 scripts made by Aspect, debugged by Grok, checked by Aspect
+// @version      1.5
+// @description  Records matches and replays them. Free cam (F), pause (P), previous/next player POV (, and .), rename, export to .n1replay, import / watch from file. You can see yourself playing the match and view the POV of other players. This script is made by Claude based on 5 scripts made by Aspect, debugged by Grok, checked by Aspect.
 // @author       Claude / Grok / EF Aspect
 // @match        https://narrow.one/*
 // @run-at       document-start
@@ -19,24 +19,41 @@
   const AUTOSAVE_MS = 90000; // less frequent full packs while playing
   const MAX_NAME_LEN = 40;
   const SKIP_WHEN_RECORDING = new Set([20, 24, 55]);
-  const SKIP_WHEN_REPLAYING = new Set([9, 20, 24, 55]);
-
-  // .n1replay file format
-  const FILE_EXT = '.n1replay';
-  const FILE_MAGIC = 0x5031314e; // bytes "N11P" little-endian marker (checked as u32)
-  const FILE_VERSION = 1;
-  const MAX_FILE_BYTES = 512 * 1024 * 1024;
+  // 9 keepalive (client would answer), 20 reconnect token, 23 coins, 24 guest account, 27/28 squad,
+  // 55 server code, 61 forced logout: a replay file must never trigger any of these
+  const SKIP_WHEN_REPLAYING = new Set([9, 20, 23, 24, 27, 28, 55, 61]);
 
   // Replay feed budget (kept light; lag report was recording-only)
   const FEED_BUDGET_MS = 4;
   const FEED_MAX = 80;
 
-  function getMain() {
+  // ------------------------------------------------------------------ main instance
+  // The game's Main instance is module-private. Its constructor calls this.vsyncLoop.bind(this),
+  // so we catch the instance there (the hook is installed at document-start, before the game loads).
+  let mainRef = null;
+  const nativeBind = Function.prototype.bind;
+  Function.prototype.bind = function (thisArg, ...args) {
     try {
-      if (typeof po === 'function') return po();
+      if (!mainRef && thisArg && thisArg.gameManager && thisArg.network && thisArg.cam && thisArg.mainMenu) {
+        mainRef = thisArg;
+      }
+    } catch {}
+    return nativeBind.call(this, thisArg, ...args);
+  };
+
+  function getMain() {
+    if (mainRef && mainRef.gameManager) return mainRef;
+    try {
+      if (typeof po === 'function') {
+        const m = po();
+        if (m && m.gameManager) return (mainRef = m);
+      }
     } catch {}
     try {
-      if (typeof globalThis.__getMain === 'function') return globalThis.__getMain();
+      if (typeof globalThis.__getMain === 'function') {
+        const m = globalThis.__getMain();
+        if (m && m.gameManager) return (mainRef = m);
+      }
     } catch {}
     return null;
   }
@@ -158,7 +175,8 @@
   };
 
   async function prune() {
-    const all = (await idb.list()).sort((a, b) => b.startedAt - a.startedAt);
+    // newest saved first (id = when it was recorded or imported)
+    const all = (await idb.list()).sort((a, b) => b.id - a.id);
     for (const m of all.slice(MAX_REPLAYS)) await idb.del(m.id);
   }
 
@@ -186,153 +204,220 @@
     while (o + 12 <= data.byteLength) {
       const t = dv.getFloat64(o, true);
       const len = dv.getUint32(o + 8, true);
-      if (o + 12 + len > data.byteLength) break; // truncated / corrupt tail
       msgs.push({ t, buf: data.slice(o + 12, o + 12 + len) });
       o += 12 + len;
     }
     return msgs;
   }
 
-  // ------------------------------------------------------------------ .n1replay export / import
-  // Layout: u32 magic | u32 version | u32 metaLen | meta JSON (utf8) | packed messages
+  // ------------------------------------------------------------------ .n1replay files
+  // Layout: "N1RP" | version u8 | flags u8 (bit0 = payload gzipped) | 2 reserved | metaLen u32 | meta JSON | payload
+  const FILE_MAGIC = 'N1RP';
+  const FILE_VERSION = 1;
+  const MAX_META_BYTES = 64 * 1024;
+  const MAX_DATA_BYTES = 300 * 1024 * 1024;
+  const MAX_MSG_BYTES = 1024 * 1024;
+  const MAX_MSGS = 3000000;
 
-  function encodeReplayFile(meta, data) {
-    const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
-    const out = new Uint8Array(12 + metaBytes.length + data.byteLength);
-    const dv = new DataView(out.buffer);
-    dv.setUint32(0, FILE_MAGIC, true);
-    dv.setUint32(4, FILE_VERSION, true);
-    dv.setUint32(8, metaBytes.length, true);
-    out.set(metaBytes, 12);
-    out.set(new Uint8Array(data), 12 + metaBytes.length);
-    return out;
+  async function streamToBuffer(stream, cap) {
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) {
+        try { await reader.cancel(); } catch {}
+        throw new Error('The replay is too large');
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) {
+      out.set(c, o);
+      o += c.byteLength;
+    }
+    return out.buffer;
   }
 
-  function decodeReplayFile(ab) {
-    if (!(ab instanceof ArrayBuffer) || ab.byteLength < 12) throw new Error('File is too small.');
-    const dv = new DataView(ab);
-    if (dv.getUint32(0, true) !== FILE_MAGIC) throw new Error('Not a valid ' + FILE_EXT + ' file.');
-    const ver = dv.getUint32(4, true);
-    if (ver > FILE_VERSION) throw new Error('This replay was made with a newer version of the script.');
+  async function gzip(buf) {
+    if (typeof CompressionStream !== 'function') return null;
+    try {
+      return await streamToBuffer(new Blob([buf]).stream().pipeThrough(new CompressionStream('gzip')), MAX_DATA_BYTES);
+    } catch {
+      return null;
+    }
+  }
+
+  async function gunzip(buf) {
+    if (typeof DecompressionStream !== 'function') {
+      throw new Error('This browser cannot open compressed replay files');
+    }
+    return streamToBuffer(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip')), MAX_DATA_BYTES);
+  }
+
+  /** Strict check of the packed messages: sizes, order, and that it really starts like a match. */
+  function validateMessages(data) {
+    const dv = new DataView(data);
+    let o = 0;
+    let count = 0;
+    let lastT = 0;
+    while (o < data.byteLength) {
+      if (o + 12 > data.byteLength) throw new Error('Replay file is damaged');
+      const t = dv.getFloat64(o, true);
+      const len = dv.getUint32(o + 8, true);
+      if (!Number.isFinite(t) || t < lastT) throw new Error('Replay file is damaged');
+      if (len < 4 || len > MAX_MSG_BYTES || o + 12 + len > data.byteLength) throw new Error('Replay file is damaged');
+      if (count === 0 && dv.getUint32(o + 12, true) !== 0) throw new Error('This is not a match replay');
+      lastT = t;
+      count++;
+      if (count > MAX_MSGS) throw new Error('The replay is too large');
+      o += 12 + len;
+    }
+    if (count === 0) throw new Error('The replay is empty');
+    return { count, lastT };
+  }
+
+  async function buildReplayFile(meta, data) {
+    const packed = await gzip(data);
+    const payload = packed || data;
+    const info = {
+      name: meta.name || undefined,
+      startedAt: meta.startedAt,
+      durationMs: meta.durationMs,
+      mapHash: meta.mapHash,
+      mapName: meta.mapName,
+      myId: meta.myId,
+      flags: meta.flags,
+      kills: meta.kills,
+      deaths: meta.deaths,
+      score: meta.score,
+      ended: !!meta.ended,
+      selfMoves: !!meta.selfMoves,
+    };
+    const metaBytes = new TextEncoder().encode(JSON.stringify(info));
+    const head = new ArrayBuffer(12);
+    const hv = new DataView(head);
+    new Uint8Array(head).set([0x4e, 0x31, 0x52, 0x50]); // "N1RP"
+    hv.setUint8(4, FILE_VERSION);
+    hv.setUint8(5, packed ? 1 : 0);
+    hv.setUint32(8, metaBytes.length, true);
+    return new Blob([head, metaBytes, payload], { type: 'application/octet-stream' });
+  }
+
+  async function parseReplayFile(file) {
+    if (file.size > MAX_DATA_BYTES) throw new Error('The replay is too large');
+    const buf = await file.arrayBuffer();
+    if (buf.byteLength < 12) throw new Error('This is not a .n1replay file');
+    const dv = new DataView(buf);
+    const magic = String.fromCharCode(...new Uint8Array(buf, 0, 4));
+    if (magic !== FILE_MAGIC) throw new Error('This is not a .n1replay file');
+    if (dv.getUint8(4) !== FILE_VERSION) throw new Error('This replay file version is not supported');
+    const flags = dv.getUint8(5);
     const metaLen = dv.getUint32(8, true);
-    if (12 + metaLen > ab.byteLength) throw new Error('File is corrupt (bad header).');
+    if (metaLen > MAX_META_BYTES || 12 + metaLen > buf.byteLength) throw new Error('Replay file is damaged');
     let raw;
     try {
-      raw = JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 12, metaLen)));
+      raw = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, metaLen)));
     } catch {
-      throw new Error('File is corrupt (bad metadata).');
+      throw new Error('Replay file is damaged');
     }
-    const data = ab.slice(12 + metaLen);
-    const msgs = unpack(data);
-    if (!msgs.length) throw new Error('File contains no replay data.');
-    const num = (v, d = 0) => (Number.isFinite(v) ? v : d);
-    const lastT = msgs[msgs.length - 1].t;
-    const startedAt = num(raw.startedAt, Date.now());
+    if (!raw || typeof raw !== 'object') throw new Error('Replay file is damaged');
+    let data = buf.slice(12 + metaLen);
+    if (flags & 1) data = await gunzip(data);
+    const info = validateMessages(data);
+
+    const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+    const num = (v) => (Number.isFinite(v) ? v : 0);
+    const mapHash = str(raw.mapHash, 200);
+    if (!mapHash) throw new Error('Replay file is damaged');
     const meta = {
-      id: num(raw.id, startedAt),
-      startedAt,
-      durationMs: num(raw.durationMs, lastT) || lastT,
-      mapHash: typeof raw.mapHash === 'string' ? raw.mapHash : '',
-      mapName: typeof raw.mapName === 'string' ? raw.mapName : 'Unknown map',
-      myId: num(raw.myId, null),
+      id: 0,
+      startedAt: num(raw.startedAt) || Date.now(),
+      durationMs: info.lastT,
+      mapHash,
+      mapName: str(raw.mapName, 80) || 'Unknown map',
+      myId: Number.isInteger(raw.myId) ? raw.myId : null,
       flags: num(raw.flags),
       kills: num(raw.kills),
       deaths: num(raw.deaths),
       score: num(raw.score),
       bytes: data.byteLength,
       ended: !!raw.ended,
+      selfMoves: !!raw.selfMoves,
+      imported: true,
     };
-    if (typeof raw.name === 'string' && raw.name.trim()) {
-      meta.name = raw.name.trim().slice(0, MAX_NAME_LEN);
-    }
+    const nm = (str(raw.name, MAX_NAME_LEN) || file.name.replace(/\.n1replay$/i, '').slice(0, MAX_NAME_LEN)).trim();
+    if (nm) meta.name = nm;
     return { meta, data };
   }
 
-  const safeFileName = (s) =>
-    String(s)
-      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+  async function saveImported(meta, data) {
+    const used = new Set((await idb.list()).map((m) => m.id));
+    let id = Date.now();
+    while (used.has(id)) id++;
+    meta.id = id;
+    await idb.put(meta, data);
+    await prune();
+  }
+
+  function fileNameFor(m) {
+    const base = replayTitle(m)
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 60) || 'replay';
-
-  async function exportReplay(m) {
-    try {
-      const data = await idb.get(m.id);
-      if (!data) return alertBox('Export failed', 'The data for this replay could not be found.');
-      const bytes = encodeReplayFile(m, data);
-      const blob = new Blob([bytes], { type: 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = safeFileName(m.name || fmtDate(m.startedAt).replace(/\//g, '-').replace(':', '.')) + FILE_EXT;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-    } catch (e) {
-      console.warn('[replay] export failed', e);
-      alertBox('Export failed', String(e && e.message ? e.message : e));
-    }
+      .slice(0, 60);
+    return (base || 'replay') + '.n1replay';
   }
 
-  function pickFile() {
-    return new Promise((resolve) => {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = FILE_EXT;
-      input.style.display = 'none';
-      let settled = false;
-      const done = (v) => {
-        if (settled) return;
-        settled = true;
-        input.remove();
-        resolve(v);
-      };
-      input.addEventListener('change', () => done(input.files && input.files[0] ? input.files[0] : null));
-      input.addEventListener('cancel', () => done(null));
-      document.body.appendChild(input);
-      input.click();
-    });
-  }
-
-  async function readReplayFile(file) {
-    if (file.size > MAX_FILE_BYTES) throw new Error('File is too large.');
-    return decodeReplayFile(await file.arrayBuffer());
-  }
-
-  async function importReplay() {
-    const file = await pickFile();
-    if (!file) return false;
-    try {
-      const { meta, data } = await readReplayFile(file);
-      const existing = await idb.getMeta(meta.id);
-      if (existing) {
-        alertBox('Already in log', 'This replay is already in your Battle Log.');
-        return false;
-      }
-      await idb.put(meta, data); // no prune here so an imported old replay isn't dropped instantly
-      return true;
-    } catch (e) {
-      console.warn('[replay] import failed', e);
-      alertBox('Import failed', String(e && e.message ? e.message : e));
-      return false;
-    }
-  }
-
-  async function watchFile() {
-    const file = await pickFile();
-    if (!file) return;
-    try {
-      const { meta, data } = await readReplayFile(file);
-      await startReplay(meta, data);
-    } catch (e) {
-      console.warn('[replay] open failed', e);
-      alertBox('Could not open file', String(e && e.message ? e.message : e));
-    }
+  function downloadBlob(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
   }
 
   // ------------------------------------------------------------------ recording (FPS-sensitive)
   let activeRec = null;
+
+  /**
+   * The server never sends you your own movement, so it is not in what we receive. To be able to watch yourself,
+   * the few packets the client sends about its own player are stored in the same format the server uses
+   * for other players (position/look, arrows, actions, class and weapon changes).
+   */
+  function convertOutgoing(op, src) {
+    const len = src.byteLength;
+    if (op === 2 && len >= 16) {
+      // my position + look direction -> a "player positions" packet with one entry
+      const out = new ArrayBuffer(18);
+      const o = new DataView(out);
+      const s = new DataView(src);
+      o.setUint32(0, 4, true);
+      o.setUint16(4, 0, true);
+      for (let i = 0; i < 6; i++) o.setUint16(6 + i * 2, s.getUint16(4 + i * 2, true), true);
+      return out;
+    }
+    if (op === 3 && len >= 22) {
+      // my arrow -> "arrow created" (same layout, different opcode)
+      const out = src.slice(0, 22);
+      new DataView(out).setUint32(0, 5, true);
+      return out;
+    }
+    if ((op === 9 || op === 10 || op === 26) && len >= 12) {
+      // jump / fire / die, class change, weapon type -> what the server tells others
+      const out = src.slice(0, 12);
+      new DataView(out).setUint32(0, op === 9 ? 15 : op === 10 ? 18 : 37, true);
+      return out;
+    }
+    return null;
+  }
 
   function scheduleSave(rec, urgent) {
     if (!rec || rec.saveQueued) return;
@@ -342,6 +427,7 @@
       saveRec(rec);
     };
     if (urgent) {
+      // tab closing — still async but sooner
       setTimeout(run, 0);
       return;
     }
@@ -358,6 +444,7 @@
       rec.again = true;
       return;
     }
+    // Skip if nothing new since last successful save (big FPS win while playing)
     if (
       rec.messages.length === rec.lastSavedLen &&
       rec.ended === rec.lastSavedEnded
@@ -370,6 +457,7 @@
     rec.saving = true;
     try {
       const sc = rec.scores.get(rec.myId) || [0, 0, 0, 0];
+      // Pack can be large — we only reach here from idle / timer / leave
       const data = pack(rec.messages);
       const meta = {
         id: rec.startedAt,
@@ -384,6 +472,7 @@
         score: sc[3],
         bytes: data.byteLength,
         ended: rec.ended,
+        selfMoves: rec.selfMoves || rec.serverSendsSelf,
       };
       try {
         const old = await idb.getMeta(rec.startedAt);
@@ -407,11 +496,13 @@
   function attachRecorder(ws) {
     let rec = null;
 
+    // Hot path: minimize work per packet
     ws.addEventListener('message', (e) => {
       if (R.active) return;
       const raw = e.data;
       if (typeof raw === 'string') return;
       if (!(raw instanceof ArrayBuffer)) {
+        // Blob path is rare for game socket; handle off-tick
         if (raw instanceof Blob) {
           raw.arrayBuffer().then((ab) => onPacket(ab)).catch(() => {});
         }
@@ -421,6 +512,7 @@
     });
 
     function onPacket(buf0) {
+      // Op only — 4 bytes — before full copy when skipping
       if (buf0.byteLength < 4) return;
       const op = new DataView(buf0).getUint32(0, true);
 
@@ -439,6 +531,10 @@
           saveQueued: false,
           lastSavedLen: 0,
           lastSavedEnded: false,
+          selfMoves: false,
+          serverSendsSelf: false,
+          selfDecided: false,
+          selfChecks: 0,
         };
         activeRec = rec;
       }
@@ -448,8 +544,10 @@
       const buf = copyBuf(buf0);
       if (!buf) return;
 
+      // push only — no object alloc beyond {t,buf}
       rec.messages.push({ t: performance.now() - rec.t0, buf });
 
+      // Meta updates only for rare ops
       if (op === 14) {
         try {
           rec.mapHash = readStr(buf, 4);
@@ -470,8 +568,42 @@
       } else if (op === 11) {
         rec.ended = true;
         scheduleSave(rec, true);
+      } else if (op === 4 && !rec.selfDecided && rec.myId != null) {
+        // does the server already send my own position? (then we must not add our own copy)
+        const dv = new DataView(buf);
+        for (let o = 6; o + 12 <= buf.byteLength; o += 12) {
+          if (dv.getUint16(o, true) === rec.myId) {
+            rec.serverSendsSelf = true;
+            rec.selfDecided = true;
+            break;
+          }
+        }
+        if (!rec.selfDecided && ++rec.selfChecks >= 200) rec.selfDecided = true;
       }
     }
+
+    // what the client sends about its own player (see convertOutgoing)
+    const origSend = ws.send;
+    ws.send = function (data) {
+      try {
+        if (rec && !R.active) {
+          let src = null;
+          if (data instanceof ArrayBuffer) src = data;
+          else if (ArrayBuffer.isView(data)) src = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+          if (src && src.byteLength >= 12) {
+            const op = new DataView(src).getUint32(0, true);
+            if (!(op === 2 && rec.serverSendsSelf)) {
+              const out = convertOutgoing(op, src);
+              if (out) {
+                if (op === 2) rec.selfMoves = true;
+                rec.messages.push({ t: performance.now() - rec.t0, buf: out });
+              }
+            }
+          }
+        }
+      } catch {}
+      return origSend.apply(this, arguments);
+    };
 
     ws.addEventListener('close', () => {
       if (rec) {
@@ -526,10 +658,50 @@
     lastHud: 0,
     hud: null,
     meta: null,
+    giveOwnership: false,
+    view: 0,
   };
   const SPEEDS = [1, 2, 4, 0.5];
+  const VIEWS = ['back', 'front', 'none']; // behind / in front / first person
 
-  // dataOverride: an ArrayBuffer (used when watching straight from a file)
+  // ------------------------------------------------------------------ input lock
+  // While a replay runs, the game's own controls (walk, jump, fire, weapons, chat, Y view toggle...) are switched
+  // off, so nothing you press can move or shoot a player. The keys are restored when the replay ends.
+  const LOCKED_KEYS = [
+    'left', 'right', 'up', 'down', 'flyUp', 'flyDown', 'jump', 'fire',
+    'prevWeapon', 'nextWeapon', 'toggleWeapon', 'toggleThirdPerson', 'chat',
+  ];
+  let savedKeys = null;
+
+  function lockGameInput() {
+    if (savedKeys) return;
+    const main = getMain();
+    const keys = main?.input?.keys;
+    if (!keys) return;
+    savedKeys = [];
+    for (const name of LOCKED_KEYS) {
+      const k = keys.get(name);
+      if (!k) continue;
+      savedKeys.push({ k, keyCodes: k.keyCodes, mouseButtons: k.mouseButtons, gamepadButtons: k.gamepadButtons });
+      k.keyCodes = [];
+      k.mouseButtons = [];
+      k.gamepadButtons = [];
+      try { k.setKeyPressed(false, true); } catch {}
+    }
+    try { main.input.updateAxisInputs(); } catch {}
+  }
+
+  function unlockGameInput() {
+    if (!savedKeys) return;
+    for (const s of savedKeys) {
+      s.k.keyCodes = s.keyCodes;
+      s.k.mouseButtons = s.mouseButtons;
+      s.k.gamepadButtons = s.gamepadButtons;
+    }
+    savedKeys = null;
+    try { getMain().input.updateAxisInputs(); } catch {}
+  }
+
   async function startReplay(meta, dataOverride) {
     const main = getMain();
     if (!main) return alertBox('Replay', 'Game not ready yet — wait a second on the menu and try again.');
@@ -537,6 +709,12 @@
     if (main.gameManager.getOnlineGame()) {
       return alertBox('You are in a match', 'Leave your current match before watching a replay.');
     }
+    try {
+      const mc = main.config.mapsConfig;
+      if (mc.loadedConfigData && !mc.getListedMapConfigByHash(meta.mapHash)) {
+        return alertBox('Map not available', 'This replay was recorded on a map that your game no longer lists (the map was removed or updated).');
+      }
+    } catch {}
     const data = dataOverride || (await idb.get(meta.id));
     if (!data) return alertBox('Replay missing', 'The data for this replay could not be found.');
 
@@ -552,8 +730,14 @@
     R.lastIcons = 0;
     R.lastHud = 0;
     R.meta = meta;
+    // New replays contain your own movement, so you are shown like every other player.
+    // Old replays do not, there the game keeps its own (standing) player as before.
+    R.giveOwnership = !meta.selfMoves;
+    R.view = 0;
     R.active = true;
     R.last = performance.now();
+    lockGameInput();
+    installWrappers(main);
     closeOverlay();
     showHud();
     R.raf = requestAnimationFrame(tick);
@@ -586,7 +770,7 @@
       g.weaponSelectionDialog.setPlayerVisibility(false);
     } catch {}
     try {
-      main.cam.setThirdPersonMode('back');
+      main.cam.setThirdPersonMode(VIEWS[R.view]);
     } catch {}
     try {
       main.mainMenu.setJoinState('joined');
@@ -605,7 +789,11 @@
     if (SKIP_WHEN_REPLAYING.has(op)) return;
     if (op === 3 && buf.byteLength >= 12) {
       const u = new DataView(buf);
-      if (u.getUint32(8, true) === 1) R.target = u.getUint32(4, true);
+      if (u.getUint32(8, true) === 1) {
+        R.target = u.getUint32(4, true);
+        // do not hand your player to the local input: it is shown from the recorded movement instead
+        if (!R.giveOwnership) return;
+      }
     }
     try {
       main.network.onMessage(new Uint8Array(buf));
@@ -671,6 +859,8 @@
     R.active = false;
     cancelAnimationFrame(R.raf);
     disableFreecam();
+    removeWrappers();
+    unlockGameInput();
     hideHud();
     const main = getMain();
     try {
@@ -685,16 +875,41 @@
     R.target = null;
   }
 
+  /** Take over the POV of the previous (-1) / next (+1) player. Leaves free cam if it was on. */
   function cycleTarget(dir) {
     if (!R.game?.players) return;
     const ids = [...R.game.players.keys()].sort((a, b) => a - b);
     if (!ids.length) return;
+    if (FC.on) disableFreecam();
     let i = ids.indexOf(R.target);
+    if (i < 0) i = dir > 0 ? -1 : 0;
     i = (i + dir + ids.length) % ids.length;
     R.target = ids[i];
     R.lastTeam = -1;
     try {
       getMain().cam.thirdPersonPhysicsNeedsReset = true;
+    } catch {}
+  }
+
+  /** Back to the player you recorded (yourself). */
+  function viewMyself() {
+    if (R.meta && R.meta.myId != null && R.game?.players?.has(R.meta.myId)) {
+      R.target = R.meta.myId;
+      R.lastTeam = -1;
+      disableFreecam();
+      try {
+        getMain().cam.thirdPersonPhysicsNeedsReset = true;
+      } catch {}
+    }
+  }
+
+  /** Behind -> in front -> first person of the player you follow. */
+  function cycleView() {
+    R.view = (R.view + 1) % VIEWS.length;
+    try {
+      const cam = getMain().cam;
+      cam.setThirdPersonMode(VIEWS[R.view]);
+      cam.thirdPersonPhysicsNeedsReset = true;
     } catch {}
   }
 
@@ -709,6 +924,8 @@
   };
 
   // ------------------------------------------------------------------ free cam
+  // WASD moves flat over the ground (looking up/down does not change your height).
+  // Height only changes with Space / E (up) and Q / Shift (down). X = fast, wheel = speed, F = back to following.
   const FC = {
     on: false,
     wrapped: false,
@@ -731,6 +948,7 @@
     'KeyD',
     'KeyE',
     'KeyQ',
+    'KeyX',
     'Space',
     'ShiftLeft',
     'ShiftRight',
@@ -769,7 +987,10 @@
     { capture: true, passive: false }
   );
 
-  function installFcWrappers(main) {
+  // Wrappers live for the whole replay: they cancel any walking input (so no player can be moved from the
+  // keyboard / gamepad / touch) and, while free cam is on, they turn the mouse into free cam rotation and
+  // put the camera at the free cam position.
+  function installWrappers(main) {
     if (FC.wrapped) return;
     const input = main.input;
     const cam = main.cam;
@@ -777,9 +998,11 @@
     const origCamLoop = cam.loop.bind(cam);
     input.loop = function (...args) {
       const r = origInputLoop(...args);
-      if (FC.on) {
-        FC.look[0] += this.lookInput.x;
-        FC.look[1] += this.lookInput.y;
+      if (R.active) {
+        if (FC.on) {
+          FC.look[0] += this.lookInput.x;
+          FC.look[1] += this.lookInput.y;
+        }
         this.lookInput.set(0, 0);
         this.walkInput.set(0, 0);
       }
@@ -797,6 +1020,16 @@
     FC.wrapped = true;
   }
 
+  function removeWrappers() {
+    if (FC.restore) {
+      try {
+        FC.restore();
+      } catch {}
+    }
+    FC.restore = null;
+    FC.wrapped = false;
+  }
+
   function applyFreecam(camMgr) {
     const now = performance.now();
     const dt = Math.min((now - FC.last) / 1000, 0.1);
@@ -808,16 +1041,17 @@
     const k = FC.keys;
     const fwd = (k.has('KeyW') ? 1 : 0) - (k.has('KeyS') ? 1 : 0);
     const right = (k.has('KeyD') ? 1 : 0) - (k.has('KeyA') ? 1 : 0);
-    const up = (k.has('KeyE') || k.has('Space') ? 1 : 0) - (k.has('KeyQ') ? 1 : 0);
-    const fast = k.has('ShiftLeft') || k.has('ShiftRight') ? 3 : 1;
+    const up =
+      (k.has('Space') || k.has('KeyE') ? 1 : 0) -
+      (k.has('KeyQ') || k.has('ShiftLeft') || k.has('ShiftRight') ? 1 : 0);
+    const fast = k.has('KeyX') ? 3 : 1;
     const v = FC.speed * fast * dt;
-    const cp = Math.cos(FC.pitch);
-    const sp = Math.sin(FC.pitch);
     const sy = Math.sin(FC.yaw);
     const cy = Math.cos(FC.yaw);
-    FC.x += (-sy * cp * fwd + cy * right) * v;
-    FC.y += (sp * fwd + up) * v;
-    FC.z += (-cy * cp * fwd - sy * right) * v;
+    // flat movement: only the yaw matters for W/A/S/D, height is changed by `up` alone
+    FC.x += (-sy * fwd + cy * right) * v;
+    FC.z += (-cy * fwd - sy * right) * v;
+    FC.y += up * v;
     const c = camMgr.cam;
     c.position.set(FC.x, FC.y, FC.z);
     c.rotation.order = 'YXZ';
@@ -847,20 +1081,13 @@
     FC.look = [0, 0];
     FC.last = performance.now();
     FC.on = true;
-    installFcWrappers(main);
+    installWrappers(main);
   }
 
   function disableFreecam() {
-    if (!FC.on && !FC.wrapped) return;
+    if (!FC.on) return;
     FC.on = false;
     FC.keys.clear();
-    if (FC.restore) {
-      try {
-        FC.restore();
-      } catch {}
-    }
-    FC.restore = null;
-    FC.wrapped = false;
     try {
       getMain().cam.thirdPersonPhysicsNeedsReset = true;
     } catch {}
@@ -868,17 +1095,24 @@
 
   const toggleFreecam = () => (FC.on ? disableFreecam() : enableFreecam());
 
+  // Keys:  P pause · F free cam · , previous player POV · . next player POV · M back to yourself
+  //        V view (behind / front / first person) · O speed · L +30s · Esc exit
+  //        (B / N also work as previous / next player)
   function onKey(e) {
     if (!R.active) return;
     const tag = e.target && e.target.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.code === 'Escape') return stopReplay(false);
+    if (e.repeat) return;
     if (e.code === 'KeyP') togglePause();
-    else if (e.code === 'KeyN') cycleTarget(1);
-    else if (e.code === 'KeyB') cycleTarget(-1);
-    else if (e.code === 'KeyL') skip(30000);
-    else if (e.code === 'KeyO') cycleSpeed();
+    else if (e.code === 'Comma' || e.code === 'KeyB') cycleTarget(-1);
+    else if (e.code === 'Period' || e.code === 'KeyN') cycleTarget(1);
     else if (e.code === 'KeyF') toggleFreecam();
-    else if (e.code === 'Escape') stopReplay(false);
+    else if (e.code === 'KeyM') viewMyself();
+    else if (e.code === 'KeyV') cycleView();
+    else if (e.code === 'KeyO') cycleSpeed();
+    else if (e.code === 'KeyL') skip(30000);
   }
   window.addEventListener('keydown', onKey, true);
 
@@ -893,6 +1127,7 @@
       b.addEventListener('click', (e) => {
         e.stopPropagation();
         fn();
+        b.blur();
       });
       return b;
     };
@@ -900,14 +1135,16 @@
     const pause = btn('Pause', 'P', togglePause);
     const speed = btn('1x', 'O', cycleSpeed);
     const fwd = btn('+30s', 'L', () => skip(30000));
-    const prev = btn('<', 'B', () => cycleTarget(-1));
+    const me = btn('Me', 'M — follow yourself', viewMyself);
+    const prev = btn('<', ', — previous player POV', () => cycleTarget(-1));
     const name = $('span', 'tc-hud-name', '-');
-    const next = btn('>', 'N', () => cycleTarget(1));
-    const free = btn('Free cam', 'F', toggleFreecam);
+    const next = btn('>', '. — next player POV', () => cycleTarget(1));
+    const view = btn('View', 'V — behind / in front / first person', cycleView);
+    const free = btn('Free cam', 'F — WASD move, Space/E up, Q/Shift down, X fast, wheel = speed', toggleFreecam);
     const time = $('span', 'tc-hud-time', '0:00');
     const exit = btn('Exit', 'Esc', () => stopReplay(false));
     exit.classList.add('tc-danger');
-    root.append(title, pause, speed, fwd, prev, name, next, free, time, exit);
+    root.append(title, pause, speed, fwd, me, prev, name, next, view, free, time, exit);
     document.body.appendChild(root);
     R.hud = { root, pause, speed, name, time, free };
   }
@@ -923,7 +1160,8 @@
       h.name.textContent = `FREE CAM · speed ${FC.speed.toFixed(0)}`;
     } else {
       const p = R.game && R.game.players.get(R.target);
-      h.name.textContent = p ? p.playerName || 'Player ' + p.id : '-';
+      const label = p ? p.playerName || 'Player ' + p.id : '-';
+      h.name.textContent = p && R.meta && p.id === R.meta.myId ? label + ' (you)' : label;
     }
     const done = R.idx >= R.msgs.length && R.vt >= R.total;
     h.time.textContent = done
@@ -984,22 +1222,23 @@
     });
     const panel = $('div', 'tc-panel');
     panel.appendChild($('h2', 'blueNight tc-title', 'Battle Log'));
-
-    const tools = $('div', 'tc-tools');
-    const importBtn = $('button', 'tc-btn', 'Import file');
-    importBtn.title = 'Add a ' + FILE_EXT + ' file to your Battle Log';
-    importBtn.addEventListener('click', async () => {
-      if (await importReplay()) openList();
-    });
-    const watchBtn = $('button', 'tc-btn', 'Watch file');
-    watchBtn.title = 'Play a ' + FILE_EXT + ' file directly without saving it';
-    watchBtn.addEventListener('click', watchFile);
-    tools.append(importBtn, watchBtn);
-    panel.appendChild(tools);
-
     if (activeRec) {
       panel.appendChild($('div', 'tc-note', 'Recording current match…'));
     }
+
+    // open a .n1replay file: watch it right away or save it to the list
+    const bar = $('div', 'tc-bar');
+    const openFile = $('button', 'tc-btn', 'Open .n1replay file…');
+    const fileInput = $('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.n1replay,application/octet-stream';
+    fileInput.style.display = 'none';
+    openFile.addEventListener('click', () => fileInput.click());
+    bar.append(openFile, fileInput);
+    panel.appendChild(bar);
+    const cardHost = $('div', 'tc-cardhost');
+    panel.appendChild(cardHost);
+
     const list = $('div', 'tc-list');
     panel.appendChild(list);
     const close = $('button', 'tc-btn', 'Close');
@@ -1008,13 +1247,58 @@
     ov.appendChild(panel);
     document.body.appendChild(ov);
 
+    const showError = (msg) => {
+      cardHost.textContent = '';
+      cardHost.appendChild($('div', 'tc-err', msg));
+    };
+    const showImportCard = (meta, data) => {
+      cardHost.textContent = '';
+      const card = $('div', 'tc-card');
+      const info = $('div', 'tc-info');
+      info.appendChild($('div', 'tc-date', replayTitle(meta)));
+      info.appendChild(
+        $('div', 'tc-sub', `${meta.mapName} · ${fmtDur(meta.durationMs)} · K/D ${meta.kills}/${meta.deaths} · Flags ${meta.flags} · ${(meta.bytes / 1024).toFixed(0)} KB`)
+      );
+      const watch = $('button', 'tc-btn', 'Watch');
+      watch.addEventListener('click', () => startReplay(meta, data));
+      const save = $('button', 'tc-btn', 'Save to list');
+      save.addEventListener('click', async () => {
+        save.disabled = true;
+        try {
+          await saveImported(meta, data);
+          openList();
+        } catch (e) {
+          showError('Could not save the replay: ' + (e && e.message ? e.message : e));
+        }
+      });
+      const cancel = $('button', 'tc-btn', 'Cancel');
+      cancel.addEventListener('click', () => {
+        cardHost.textContent = '';
+      });
+      card.append(info, watch, save, cancel);
+      cardHost.appendChild(card);
+    };
+    fileInput.addEventListener('change', async () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileInput.value = '';
+      if (!f) return;
+      cardHost.textContent = '';
+      cardHost.appendChild($('div', 'tc-note', 'Reading file…'));
+      try {
+        const { meta, data } = await parseReplayFile(f);
+        showImportCard(meta, data);
+      } catch (e) {
+        showError('Could not open this file: ' + (e && e.message ? e.message : e));
+      }
+    });
+
     let metas = [];
     try {
-      metas = (await idb.list()).sort((a, b) => b.startedAt - a.startedAt);
+      metas = (await idb.list()).sort((a, b) => b.id - a.id);
     } catch {}
     if (!metas.length) {
       list.appendChild(
-        $('div', 'tc-note', 'No battles yet. Play a match longer than 15s, or import a ' + FILE_EXT + ' file.')
+        $('div', 'tc-note', 'No battles yet. Play a match longer than 15s, or open a .n1replay file.')
       );
       return;
     }
@@ -1027,9 +1311,10 @@
         $(
           'div',
           'tc-sub',
-          `${m.name ? fmtDate(m.startedAt) + ' · ' : ''}${m.mapName || 'Unknown'} · ${fmtDur(m.durationMs)} · K/D ${m.kills}/${m.deaths} · Flags ${m.flags} · Score ${m.score} · ${(m.bytes / 1024).toFixed(0)} KB${m.ended ? '' : ' · incomplete'}`
+          `${m.name ? fmtDate(m.startedAt) + ' · ' : ''}${m.mapName || 'Unknown'} · ${fmtDur(m.durationMs)} · K/D ${m.kills}/${m.deaths} · Flags ${m.flags} · Score ${m.score} · ${(m.bytes / 1024).toFixed(0)} KB${m.ended ? '' : ' · incomplete'}${m.imported ? ' · imported' : ''}`
         )
       );
+      const actions = $('div', 'tc-actions');
       const watch = $('button', 'tc-btn', 'Watch');
       watch.addEventListener('click', () => startReplay(m));
       const rename = $('button', 'tc-btn', 'Rename');
@@ -1037,8 +1322,24 @@
         startRename(m, row.querySelector('.tc-date') || titleEl)
       );
       const exp = $('button', 'tc-btn', 'Export');
-      exp.title = 'Save as ' + FILE_EXT;
-      exp.addEventListener('click', () => exportReplay(m));
+      exp.addEventListener('click', async () => {
+        exp.disabled = true;
+        exp.textContent = '…';
+        let ok = false;
+        try {
+          const data = await idb.get(m.id);
+          if (!data) throw new Error('data missing');
+          downloadBlob(await buildReplayFile(m, data), fileNameFor(m));
+          ok = true;
+        } catch (e) {
+          console.warn('[replay] export failed', e);
+        }
+        exp.textContent = ok ? 'Export' : 'Failed';
+        setTimeout(() => {
+          exp.disabled = false;
+          exp.textContent = 'Export';
+        }, ok ? 0 : 2000);
+      });
       const del = $('button', 'tc-btn tc-danger', 'Delete');
       let armed = false;
       del.addEventListener('click', async () => {
@@ -1054,7 +1355,8 @@
         await idb.del(m.id);
         row.remove();
       });
-      row.append(info, watch, rename, exp, del);
+      actions.append(watch, rename, exp, del);
+      row.append(info, actions);
       list.appendChild(row);
     }
   }
@@ -1062,20 +1364,24 @@
   const CSS = `
     #tcReplayOverlay{position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center}
     .tc-panel{background:var(--default-ui-bg-color,#fff);color:var(--default-text-color,#000);padding:24px;border-radius:14px;
-      width:min(780px,94vw);max-height:80vh;display:flex;flex-direction:column;gap:12px;filter:var(--default-drop-shadow)}
+      width:min(720px,94vw);max-height:84vh;display:flex;flex-direction:column;gap:12px;filter:var(--default-drop-shadow)}
     .tc-title{margin:0;font-size:38px}
-    .tc-tools{display:flex;gap:8px}
+    .tc-bar{display:flex;gap:8px}
     .tc-list{overflow-y:auto;display:flex;flex-direction:column;gap:8px;min-height:60px}
-    .tc-row{display:flex;align-items:center;gap:8px;background:var(--container-ui-bg-color,#eee);padding:10px 12px;border-radius:10px}
+    .tc-row,.tc-card{display:flex;align-items:center;gap:8px;background:var(--container-ui-bg-color,#eee);padding:10px 12px;border-radius:10px}
+    .tc-card{border:2px solid var(--default-wrinkled-paper-border-color,#353535)}
     .tc-info{flex:1;min-width:0}
+    .tc-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
     .tc-date{font-weight:bold;font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .tc-sub{font-size:12px;opacity:.75}
     .tc-note{opacity:.75;padding:6px 2px}
+    .tc-err{color:#d22;padding:6px 2px}
     .tc-input{width:100%;box-sizing:border-box;font:inherit;font-weight:bold;font-size:18px;padding:2px 6px;border-radius:6px;
       border:2px solid var(--default-wrinkled-paper-border-color,#353535);background:var(--default-ui-bg-color,#fff);color:var(--default-text-color,#000)}
     .tc-btn{cursor:pointer;border:2px solid var(--default-wrinkled-paper-border-color,#353535);background:var(--default-ui-bg-color,#fff);
       color:var(--default-text-color,#000);border-radius:8px;padding:6px 12px;font-size:14px}
     .tc-btn:hover{filter:brightness(.9)}
+    .tc-btn:disabled{opacity:.5;cursor:default}
     .tc-danger{color:#d22}
     .tc-on{background:#2a8a3a !important;color:#fff !important}
     #tcReplayHud{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:900;display:flex;align-items:center;gap:8px;
@@ -1085,17 +1391,9 @@
     #tcReplayHud .tc-hud-time{min-width:90px;text-align:center}
   `;
 
-  function ensureUi() {
-    if (!document.getElementById('tcReplayStyle') && document.head) {
-      const s = $('style');
-      s.id = 'tcReplayStyle';
-      s.textContent = CSS;
-      document.head.appendChild(s);
-    }
-    const cont = document.querySelector('.menu-buttons-container');
-    if (!cont || document.getElementById('tcReplayBtn')) return;
-    const wrap = $('div', 'main-menu-button-container');
-    wrap.id = 'tcReplayBtn';
+  // The Replays button is added to every menu button container (start screen and Esc menu).
+  function makeReplayButton() {
+    const wrap = $('div', 'main-menu-button-container tc-replay-btn');
     const btn = $('button', 'wrinkledPaper main-menu-button');
     btn.style.cssText = `--wrinkled-paper-seed:${1 + Math.floor(Math.random() * 99999)}`;
     btn.setAttribute('aria-label', 'Replays');
@@ -1105,9 +1403,21 @@
       'background:var(--default-text-color);clip-path:polygon(35% 25%,35% 75%,75% 50%);';
     btn.appendChild(icon);
     wrap.append(btn, $('div', 'main-menu-button-text whiteBigText blueNight', 'Replays'));
-    cont.appendChild(wrap);
+    return wrap;
   }
-  setInterval(ensureUi, 1000);
 
-  console.log('[replay] v1.4 — export/import .n1replay, watch from file');
+  function ensureUi() {
+    if (!document.getElementById('tcReplayStyle') && document.head) {
+      const s = $('style');
+      s.id = 'tcReplayStyle';
+      s.textContent = CSS;
+      document.head.appendChild(s);
+    }
+    for (const cont of document.querySelectorAll('.menu-buttons-container')) {
+      if (!cont.querySelector('.tc-replay-btn')) cont.appendChild(makeReplayButton());
+    }
+  }
+  setInterval(ensureUi, 500);
+
+  console.log('[replay] v1.5 — input lock during replays, free cam, , / . player POV, P pause, F free cam');
 })();
