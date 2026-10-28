@@ -1,2 +1,3 @@
 v1.0: Release
       - v1.0.1: Added V2 incase viewing replay isn't possible
+v1.1: Added the ability to see your self fighting. Removed V2
